@@ -173,6 +173,7 @@ class Bootstrapper:
         self._resolver = bootstrap_requirement_resolver.BootstrapRequirementResolver(
             ctx=ctx,
             prev_graph=prev_graph,
+            multiple_versions=multiple_versions,
         )
         # Push items onto the stack as we start to resolve their
         # dependencies so at the end we have a list of items that need to
@@ -258,6 +259,7 @@ class Bootstrapper:
         req: Requirement,
         req_type: RequirementType,
         return_all_versions: bool = False,
+        skip_age_filter: bool = False,
     ) -> list[tuple[str, Version]]:
         """Resolve version(s) of a requirement.
 
@@ -272,6 +274,8 @@ class Bootstrapper:
             req_type: Type of requirement
             return_all_versions: If True, return all matching versions.
                 If False, return only highest version.
+            skip_age_filter: If ``True``, resolve without applying
+                ``max_release_age`` filtering.
 
         Returns:
             List of (url, version) tuples. Contains one item when
@@ -307,6 +311,7 @@ class Bootstrapper:
             req_type=req_type,
             parent_req=parent_req,
             return_all_versions=return_all_versions,
+            skip_age_filter=skip_age_filter,
         )
 
     def _processing_build_requirement(self, current_req_type: RequirementType) -> bool:
@@ -668,6 +673,26 @@ class Bootstrapper:
             return cached_wheel, unpacked
 
         return None, None
+
+    def _has_any_cached_wheel(self, req: Requirement) -> bool:
+        """Check if ANY version of a package has a cached wheel locally.
+
+        Scans local wheel directories for any ``.whl`` file matching the
+        package name.  Used to determine whether a package can be safely
+        skipped when all versions are filtered by ``max-release-age``.
+        """
+        prefix = finders._dist_name_to_filename(req.name).lower() + "-"
+        for search_dir in (
+            self.ctx.wheels_build,
+            self.ctx.wheels_downloads,
+            self.ctx.wheels_prebuilt,
+        ):
+            if not search_dir.exists():
+                continue
+            for whl in search_dir.glob("*.whl"):
+                if whl.name.lower().startswith(prefix):
+                    return True
+        return False
 
     def _get_install_dependencies(
         self,
@@ -1341,17 +1366,49 @@ class Bootstrapper:
         wheels are already cached to avoid redundant builds and
         transitive dependency processing.
 
+        When ``max-release-age`` filtering yields no candidates in
+        multiple-version mode, checks the local wheel cache:
+
+        - Cached wheel exists: skip the package (return empty list).
+        - No cached wheel: re-resolve without the age filter so the
+          package can still be built for the first time.
+
         Returns:
             One START-phase item per resolved version that needs building.
-            Empty list if all versions are already cached.
+            Empty list if all versions are already cached or skipped.
         """
         resolved_versions = self.resolve_versions(
             item.req,
             item.req_type,
             return_all_versions=self.multiple_versions,
         )
+
         if not resolved_versions:
-            raise RuntimeError(f"Could not resolve any versions for {item.req}")
+            if not self.multiple_versions:
+                raise RuntimeError(f"Could not resolve any versions for {item.req}")
+
+            if self._has_any_cached_wheel(item.req):
+                logger.info(
+                    "%s: all versions filtered by max-release-age, "
+                    "cached wheel exists; skipping",
+                    item.req.name,
+                )
+                return []
+
+            # No cached wheel — fall back to unfiltered resolution
+            logger.warning(
+                "%s: all versions filtered by max-release-age and no "
+                "cached wheel exists; falling back to unfiltered resolution",
+                item.req.name,
+            )
+            resolved_versions = self.resolve_versions(
+                item.req,
+                item.req_type,
+                return_all_versions=True,
+                skip_age_filter=True,
+            )
+            if not resolved_versions:
+                raise RuntimeError(f"Could not resolve any versions for {item.req}")
 
         if self.multiple_versions:
             logger.info(f"resolved {len(resolved_versions)} version(s) for {item.req}")

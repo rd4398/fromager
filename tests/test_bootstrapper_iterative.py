@@ -353,6 +353,100 @@ class TestPhaseResolve:
         assert len(result) == 1
         mock_cache.assert_not_called()
 
+    def test_age_filtered_all_with_cache_skips_package(
+        self, tmp_context: WorkContext
+    ) -> None:
+        """When all versions are age-filtered and a cached wheel exists, skip entirely."""
+        bt = bootstrapper.Bootstrapper(tmp_context, multiple_versions=True)
+        item = _make_resolve_item()
+
+        with (
+            patch.object(bt, "resolve_versions", return_value=[]),
+            patch.object(bt, "_has_any_cached_wheel", return_value=True),
+        ):
+            result = bt._phase_resolve(item)
+
+        assert result == []
+
+    def test_age_filtered_all_without_cache_falls_back(
+        self, tmp_context: WorkContext
+    ) -> None:
+        """When all versions are age-filtered and no cached wheel, re-resolve without filter."""
+        bt = bootstrapper.Bootstrapper(tmp_context, multiple_versions=True)
+        item = _make_resolve_item()
+
+        call_count = 0
+
+        def mock_resolve(
+            req: Requirement,
+            req_type: RequirementType,
+            return_all_versions: bool = False,
+            skip_age_filter: bool = False,
+        ) -> list:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return []
+            return [("url-1.0", Version("1.0"))]
+
+        with (
+            patch.object(bt, "resolve_versions", side_effect=mock_resolve),
+            patch.object(bt, "_has_any_cached_wheel", return_value=False),
+        ):
+            result = bt._phase_resolve(item)
+
+        assert len(result) == 1
+        assert result[0].resolved_version == Version("1.0")
+        assert call_count == 2
+
+    def test_empty_resolution_raises_in_single_version_mode(
+        self, tmp_context: WorkContext
+    ) -> None:
+        """In single-version mode, empty resolution raises RuntimeError."""
+        bt = bootstrapper.Bootstrapper(tmp_context, multiple_versions=False)
+        item = _make_resolve_item()
+
+        with (
+            patch.object(bt, "resolve_versions", return_value=[]),
+            pytest.raises(RuntimeError, match="Could not resolve"),
+        ):
+            bt._phase_resolve(item)
+
+
+class TestHasAnyCachedWheel:
+    def test_finds_wheel_in_build_dir(self, tmp_context: WorkContext) -> None:
+        """Detects wheel in build directory."""
+        bt = bootstrapper.Bootstrapper(tmp_context)
+        tmp_context.wheels_build.mkdir(parents=True, exist_ok=True)
+        (tmp_context.wheels_build / "testpkg-1.0-py3-none-any.whl").touch()
+        assert bt._has_any_cached_wheel(Requirement("testpkg")) is True
+
+    def test_finds_wheel_in_downloads_dir(self, tmp_context: WorkContext) -> None:
+        """Detects wheel in downloads directory."""
+        bt = bootstrapper.Bootstrapper(tmp_context)
+        tmp_context.wheels_downloads.mkdir(parents=True, exist_ok=True)
+        (tmp_context.wheels_downloads / "testpkg-2.0-py3-none-any.whl").touch()
+        assert bt._has_any_cached_wheel(Requirement("testpkg")) is True
+
+    def test_finds_wheel_in_prebuilt_dir(self, tmp_context: WorkContext) -> None:
+        """Detects wheel in prebuilt directory."""
+        bt = bootstrapper.Bootstrapper(tmp_context)
+        tmp_context.wheels_prebuilt.mkdir(parents=True, exist_ok=True)
+        (tmp_context.wheels_prebuilt / "testpkg-3.0-py3-none-any.whl").touch()
+        assert bt._has_any_cached_wheel(Requirement("testpkg")) is True
+
+    def test_no_wheel_returns_false(self, tmp_context: WorkContext) -> None:
+        """Returns False when no cached wheel exists."""
+        bt = bootstrapper.Bootstrapper(tmp_context)
+        assert bt._has_any_cached_wheel(Requirement("nonexistent")) is False
+
+    def test_different_package_not_matched(self, tmp_context: WorkContext) -> None:
+        """Wheels for other packages are not matched."""
+        bt = bootstrapper.Bootstrapper(tmp_context)
+        tmp_context.wheels_downloads.mkdir(parents=True, exist_ok=True)
+        (tmp_context.wheels_downloads / "otherpkg-1.0-py3-none-any.whl").touch()
+        assert bt._has_any_cached_wheel(Requirement("testpkg")) is False
+
 
 class TestPhaseStart:
     def test_new_item_advances_to_prepare_source(

@@ -40,15 +40,20 @@ class BootstrapRequirementResolver:
         self,
         ctx: context.WorkContext,
         prev_graph: DependencyGraph | None = None,
+        multiple_versions: bool = False,
     ) -> None:
         """Initialize requirement resolver.
 
         Args:
             ctx: Work context with constraints and settings
             prev_graph: Optional previous dependency graph for caching
+            multiple_versions: If ``True``, age filtering returns an empty
+                list instead of falling back to all candidates, letting the
+                caller decide how to handle the case.
         """
         self.ctx = ctx
         self.prev_graph = prev_graph
+        self.multiple_versions = multiple_versions
         # Session-level resolution cache to avoid re-resolving same requirements
         # Key: (requirement_string, pre_built) to distinguish source vs prebuilt
         # Value: tuple of (url, version) tuples sorted by version (highest first)
@@ -65,6 +70,7 @@ class BootstrapRequirementResolver:
         parent_req: Requirement | None = None,
         pre_built: bool | None = None,
         return_all_versions: bool = False,
+        skip_age_filter: bool = False,
     ) -> list[tuple[str, Version]]:
         """Resolve package requirement to matching version(s).
 
@@ -81,6 +87,9 @@ class BootstrapRequirementResolver:
                 If None (default), uses package build info to determine.
             return_all_versions: If True, return all matching versions. If False,
                 return only the highest matching version.
+            skip_age_filter: If ``True``, resolve without applying
+                ``max_release_age`` filtering.  Used for fallback resolution
+                when the initial age-filtered attempt returned no candidates.
 
         Returns:
             List of (url, version) tuples sorted by version (highest first).
@@ -104,18 +113,30 @@ class BootstrapRequirementResolver:
                 f"Git URL requirements must be handled by Bootstrapper: {req}"
             )
 
-        # Check session cache (keyed by requirement + pre_built)
-        cached_result = self.get_cached_resolution(req, pre_built)
-        if cached_result is not None:
-            logger.debug(f"resolved {req} from cache")
-            return list(cached_result) if return_all_versions else [cached_result[0]]
+        # Skip session cache when age filter is overridden to avoid
+        # mixing filtered and unfiltered results.
+        if not skip_age_filter:
+            cached_result = self.get_cached_resolution(req, pre_built)
+            if cached_result is not None:
+                logger.debug(f"resolved {req} from cache")
+                return (
+                    list(cached_result) if return_all_versions else [cached_result[0]]
+                )
 
         # Resolve using strategies
-        results = self._resolve(req, req_type, parent_req, pre_built)
+        results = self._resolve(
+            req, req_type, parent_req, pre_built, skip_age_filter=skip_age_filter
+        )
 
-        # Cache the result
-        self.cache_resolution(req, pre_built, results)
-        return results if return_all_versions else [results[0]]
+        # Cache non-empty results from normal (age-filtered) resolution only.
+        if results and not skip_age_filter:
+            self.cache_resolution(req, pre_built, results)
+
+        if return_all_versions:
+            return results
+        if not results:
+            raise RuntimeError(f"No versions found for {req}")
+        return [results[0]]
 
     def _resolve(
         self,
@@ -123,6 +144,7 @@ class BootstrapRequirementResolver:
         req_type: RequirementType,
         parent_req: Requirement | None,
         pre_built: bool,
+        skip_age_filter: bool = False,
     ) -> list[tuple[str, Version]]:
         """Internal resolution logic without caching.
 
@@ -135,6 +157,7 @@ class BootstrapRequirementResolver:
             req_type: Type of requirement
             parent_req: Parent requirement from dependency chain
             pre_built: Whether to resolve prebuilt (True) or source (False)
+            skip_age_filter: If ``True``, skip ``max_release_age`` filtering.
 
         Returns:
             List of (url, version) tuples sorted by version (highest first)
@@ -175,9 +198,14 @@ class BootstrapRequirementResolver:
                 sdist_server_url=resolver.PYPI_SERVER_URL,
                 req_type=req_type,
             )
-            max_age_cutoff = resolver._compute_max_age_cutoff(self.ctx)
+            max_age_cutoff = (
+                None if skip_age_filter else resolver._compute_max_age_cutoff(self.ctx)
+            )
             return resolver.find_all_matching_from_provider(
-                provider, req, max_age_cutoff=max_age_cutoff
+                provider,
+                req,
+                max_age_cutoff=max_age_cutoff,
+                fallback_on_empty_age_filter=not self.multiple_versions,
             )
 
     def get_cached_resolution(
